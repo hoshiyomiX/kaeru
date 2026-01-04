@@ -1,0 +1,8 @@
+# Place your lk.img file here
+# This directory is for storing the bootloader image to be patched
+
+# File structure:
+# prebuilt/
+#   lk.img         - Your device's Little Kernel bootloader image
+#   lk_original    - (Optional) Backup of original LK
+#   README.md      - Documentation
