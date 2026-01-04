@@ -1,0 +1,442 @@
+name: Build & Patch Kaeru
+
+on:
+  push:
+    branches: [ deviant ]
+    paths:
+      - '**.c'
+      - '**.h'
+      - 'Makefile'
+      - 'prebuilt/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ deviant ]
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: 'Device defconfig name (without _defconfig suffix)'
+        required: false
+        default: ''
+      skip_patch:
+        description: 'Skip patching (only build payload)'
+        type: boolean
+        default: false
+      debug_mode:
+        description: 'Enable debug output'
+        type: boolean
+        default: true
+
+env:
+  KAERU_DEBUG: 1
+
+jobs:
+  analyze-lk:
+    name: Analyze LK Image
+    runs-on: ubuntu-latest
+    outputs:
+      lk_exists: ${{ steps.check.outputs.exists }}
+      lk_size: ${{ steps.check.outputs.size }}
+      base_addr: ${{ steps.parse.outputs.base_addr }}
+      config_name: ${{ steps.parse.outputs.config_name }}
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Check LK Image
+      id: check
+      run: |
+        if [ -f "prebuilt/lk.img" ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+          SIZE=$(stat -c%s "prebuilt/lk.img")
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "✅ LK image found: $(numfmt --to=iec-i --suffix=B $SIZE)"
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "❌ LK image not found at prebuilt/lk.img"
+        fi
+    
+    - name: Install Dependencies
+      if: steps.check.outputs.exists == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip binutils
+        pip3 install capstone
+        
+    - name: Parse LK Image
+      id: parse
+      if: steps.check.outputs.exists == 'true'
+      run: |
+        echo "📊 Analyzing LK image..."
+        
+        # Try to extract base address
+        python3 - <<'EOF'
+        import struct
+        import sys
+        
+        try:
+            with open('prebuilt/lk.img', 'rb') as f:
+                f.seek(512)
+                while True:
+                    data = f.read(4)
+                    if not data or len(data) < 4:
+                        break
+                    if data == b'\x10\xff\x2f\xe1':
+                        next_data = f.read(4)
+                        if next_data and len(next_data) == 4:
+                            addr = struct.unpack('<I', next_data)[0]
+                            print(f"Base address detected: 0x{addr:X}")
+                            with open('lk_base.txt', 'w') as out:
+                                out.write(f"0x{addr:X}")
+                            sys.exit(0)
+            print("Base address not found")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        EOF
+        
+        if [ -f "lk_base.txt" ]; then
+          BASE_ADDR=$(cat lk_base.txt)
+          echo "base_addr=$BASE_ADDR" >> $GITHUB_OUTPUT
+          echo "config_name=auto_detected" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️  Could not detect base address automatically"
+          echo "base_addr=unknown" >> $GITHUB_OUTPUT
+          echo "config_name=manual" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Generate Analysis Report
+      if: steps.check.outputs.exists == 'true'
+      run: |
+        echo "## LK Analysis Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| File Size | $(numfmt --to=iec-i --suffix=B ${{ steps.check.outputs.size }}) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Base Address | ${{ steps.parse.outputs.base_addr }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Extract strings for info
+        echo "### Detected Strings" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        strings prebuilt/lk.img | grep -iE "mt[0-9]{4}|mediatek|lk" | head -20 >> $GITHUB_STEP_SUMMARY || true
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  auto-generate-config:
+    name: Auto-Generate Defconfig
+    runs-on: ubuntu-latest
+    needs: analyze-lk
+    if: needs.analyze-lk.outputs.lk_exists == 'true' && github.event.inputs.device_config == ''
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip
+        pip3 install capstone
+        
+    - name: Generate Defconfig
+      id: generate
+      continue-on-error: true
+      run: |
+        echo "🔧 Attempting auto-generation of defconfig..."
+        
+        mkdir -p configs/auto
+        
+        python3 utils/parse.py prebuilt/lk.img configs/auto/ci_auto_defconfig || {
+          echo "❌ Auto-generation failed"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 0
+        }
+        
+        if [ -f "configs/auto/ci_auto_defconfig" ]; then
+          echo "✅ Defconfig generated successfully"
+          echo "success=true" >> $GITHUB_OUTPUT
+          cat configs/auto/ci_auto_defconfig
+        else
+          echo "❌ Defconfig file not created"
+          echo "success=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Upload Generated Config
+      if: steps.generate.outputs.success == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: auto-defconfig
+        path: configs/auto/ci_auto_defconfig
+        retention-days: 7
+
+  build-payload:
+    name: Build Kaeru Payload
+    runs-on: ubuntu-latest
+    needs: [analyze-lk, auto-generate-config]
+    if: always() && needs.analyze-lk.outputs.lk_exists == 'true'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Install ARM Toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-arm-linux-gnueabihf \
+          python3 \
+          python3-pip \
+          make \
+          binutils-arm-linux-gnueabi
+          
+    - name: Download Auto-Generated Config
+      if: needs.auto-generate-config.result == 'success'
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: auto-defconfig
+        path: configs/auto/
+        
+    - name: Determine Config to Use
+      id: config
+      run: |
+        if [ -n "${{ github.event.inputs.device_config }}" ]; then
+          # Manual config specified
+          CONFIG_NAME="${{ github.event.inputs.device_config }}"
+          echo "Using manual config: $CONFIG_NAME"
+          echo "config=$CONFIG_NAME" >> $GITHUB_OUTPUT
+          echo "type=manual" >> $GITHUB_OUTPUT
+        elif [ -f "configs/auto/ci_auto_defconfig" ]; then
+          # Use auto-generated
+          echo "Using auto-generated config"
+          echo "config=auto/ci_auto" >> $GITHUB_OUTPUT
+          echo "type=auto" >> $GITHUB_OUTPUT
+        else
+          # Fallback: try to find any existing config
+          FIRST_CONFIG=$(find configs -name "*_defconfig" -type f | head -1)
+          if [ -n "$FIRST_CONFIG" ]; then
+            CONFIG_BASE=$(basename "$FIRST_CONFIG" _defconfig)
+            CONFIG_DIR=$(dirname "$FIRST_CONFIG" | sed 's|configs/||')
+            echo "Using fallback config: $CONFIG_DIR/$CONFIG_BASE"
+            echo "config=$CONFIG_DIR/$CONFIG_BASE" >> $GITHUB_OUTPUT
+            echo "type=fallback" >> $GITHUB_OUTPUT
+          else
+            echo "❌ No valid config found"
+            exit 1
+          fi
+        fi
+        
+    - name: Configure Build
+      run: |
+        echo "🔧 Configuring with: ${{ steps.config.outputs.config }}_defconfig"
+        make ${{ steps.config.outputs.config }}_defconfig || {
+          echo "❌ Configuration failed"
+          echo "Available configs:"
+          find configs -name "*_defconfig"
+          exit 1
+        }
+        
+        echo "### Build Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        cat .config 2>/dev/null || echo "Config file not found"
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        
+    - name: Build Payload
+      run: |
+        echo "🔨 Building kaeru payload..."
+        make -j$(nproc) KAERU_DEBUG=${{ github.event.inputs.debug_mode && '1' || '0' }}
+        
+        if [ -f "kaeru" ]; then
+          echo "✅ Payload built successfully"
+          ls -lh kaeru
+          file kaeru
+        else
+          echo "❌ Build failed - payload not found"
+          exit 1
+        fi
+        
+    - name: Build Stage1 (if configured)
+      continue-on-error: true
+      run: |
+        if grep -q "CONFIG_STAGE1_SUPPORT=y" .config 2>/dev/null; then
+          echo "🔨 Building stage1..."
+          make stageone
+          if [ -f "stageone" ]; then
+            echo "✅ Stage1 built successfully"
+            ls -lh stageone
+          fi
+        else
+          echo "ℹ️  Stage1 not configured, skipping"
+        fi
+        
+    - name: Upload Payload
+      uses: actions/upload-artifact@v4
+      with:
+        name: kaeru-payload
+        path: |
+          kaeru
+          stageone
+        retention-days: 30
+        
+    - name: Upload Build Config
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-config
+        path: .config
+        retention-days: 7
+
+  patch-bootloader:
+    name: Patch LK Image
+    runs-on: ubuntu-latest
+    needs: [build-payload, analyze-lk]
+    if: |
+      always() && 
+      needs.build-payload.result == 'success' && 
+      needs.analyze-lk.outputs.lk_exists == 'true' &&
+      github.event.inputs.skip_patch != 'true'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip
+        pip3 install -r utils/requirements.txt || true
+        
+    - name: Download Payload
+      uses: actions/download-artifact@v4
+      with:
+        name: kaeru-payload
+        
+    - name: Download Build Config
+      uses: actions/download-artifact@v4
+      with:
+        name: build-config
+        
+    - name: Make Payload Executable
+      run: |
+        chmod +x kaeru 2>/dev/null || true
+        ls -lh kaeru
+        
+    - name: Determine Defconfig Path
+      id: defconfig
+      run: |
+        # Try to find the defconfig that was used
+        if [ -f ".config" ]; then
+          # Extract config name from .config if possible
+          if grep -q "CONFIG_.*=y" .config; then
+            # Find matching defconfig
+            DEFCONFIG=$(find configs -name "*_defconfig" -type f | head -1)
+            if [ -n "$DEFCONFIG" ]; then
+              echo "path=$DEFCONFIG" >> $GITHUB_OUTPUT
+              echo "Using defconfig: $DEFCONFIG"
+            else
+              echo "❌ No defconfig found"
+              exit 1
+            fi
+          fi
+        fi
+        
+    - name: Patch Bootloader
+      id: patch
+      run: |
+        echo "🔧 Patching LK image with kaeru payload..."
+        
+        DEFCONFIG="${{ steps.defconfig.outputs.path }}"
+        if [ -z "$DEFCONFIG" ]; then
+          DEFCONFIG=$(find configs -name "*_defconfig" -type f | head -1)
+        fi
+        
+        echo "Using defconfig: $DEFCONFIG"
+        
+        python3 utils/patch.py \
+          "$DEFCONFIG" \
+          prebuilt/lk.img \
+          kaeru \
+          -o lk.patched 2>&1 | tee patch.log
+          
+        if [ -f "lk.patched" ]; then
+          echo "✅ Patching successful"
+          echo "success=true" >> $GITHUB_OUTPUT
+          
+          echo "### Patch Results" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat patch.log >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          
+          # Compare sizes
+          ORIGINAL_SIZE=$(stat -c%s prebuilt/lk.img)
+          PATCHED_SIZE=$(stat -c%s lk.patched)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Original | $(numfmt --to=iec-i --suffix=B $ORIGINAL_SIZE) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Patched | $(numfmt --to=iec-i --suffix=B $PATCHED_SIZE) |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Patching failed"
+          echo "success=false" >> $GITHUB_OUTPUT
+          cat patch.log
+          exit 1
+        fi
+        
+    - name: Upload Patched LK
+      if: steps.patch.outputs.success == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: lk-patched
+        path: lk.patched
+        retention-days: 30
+        
+    - name: Upload Patch Log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-log
+        path: patch.log
+        retention-days: 7
+
+  generate-release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    needs: [build-payload, patch-bootloader, analyze-lk]
+    if: always()
+    
+    steps:
+    - name: Create Summary
+      run: |
+        echo "# 🐸 Kaeru Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Build Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## Job Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Analyze LK | ${{ needs.analyze-lk.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build Payload | ${{ needs.build-payload.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Patch Bootloader | ${{ needs.patch-bootloader.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.patch-bootloader.result }}" == "success" ]; then
+          echo "## ✅ Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`kaeru-payload\`: Raw payload binary" >> $GITHUB_STEP_SUMMARY
+          echo "- \`lk-patched\`: Patched bootloader ready to flash" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Flash Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "fastboot flash lk lk.patched" >> $GITHUB_STEP_SUMMARY
+          echo "fastboot reboot" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ⚠️ Build Issues" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the job logs for details." >> $GITHUB_STEP_SUMMARY
+        fi
